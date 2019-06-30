@@ -1,344 +1,569 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/select.h>
 #include <sys/ioctl.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <linux/videodev2.h>
-#include <string.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <linux/videodev2.h>
+#include <pthread.h>
 #include <errno.h>
-#include <time.h>
+#include <string.h>
+#include <assert.h>
 
-#define IMAGE_WIDTH 640
-#define IMAGE_HEIGHT 480
+#define CBUF_NUM 4
 
-/* video frame count */
-#define VIDEO_COUNT 3
-
-struct Buffer {
+struct frame_info {
+    int fd;
     void *start;
-    unsigned int length;
+    uint32_t length;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
 };
 
-static int kbhit(void) {
-    fd_set rfds;
-    struct timeval tv;
-    int retval = 0;
+struct video_buffer {
+    void *start;
+    uint32_t length;
+};
 
-    /* Watch stdin (fd 0) to see when it has input. */
-    FD_ZERO(&rfds);
-    FD_SET(0, &rfds);
+struct video_info {
+    int fd;
+    int width;
+    int height;
+    int pixelfmt;
+    struct video_buffer *bufs;
+};
 
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
+/* rgb32 structure */
+typedef struct {
+    uint8_t r; // 红色分量
+    uint8_t g; // 绿色分量
+    uint8_t b; // 蓝色分量
+    uint8_t rgbReserved; // 保留字节（用作Alpha通道或忽略）
+} rgb32;
 
-    retval = select(1, &rfds, NULL, NULL, &tv);
+/* rgb32 format in frame buffer */
+typedef struct {
+    uint8_t b;
+    uint8_t g;
+    uint8_t r;
+    uint8_t alpha;
+} rgb32_frame;
 
-    if (retval < 0) {
-        fprintf(stderr, "select error!\n");
-    }
+int open_camera(const char* path) {
+    int fd = 0;
 
-    return retval;
+    fd = open(path, O_RDWR);
+
+    return fd;
 }
 
+static int g_exit = 0;
+
+int init_framebuffer(const char* path, struct frame_info* fb_info) {
+    int fr_fd = 0;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    uint32_t screen_size = 0;
+    uint32_t frame_bpp = 0;
+    void *buf = 0;
+
+    if (path == NULL) {
+        fprintf(stderr, "path is invalid...\n");
+        return -1;
+    }
+
+    fr_fd = open(path, O_RDWR);
+    if (fr_fd < 0) {
+        fprintf(stderr, "open %s failed\n", path);
+        return -1;
+    }
+
+    /* get fixed screen information */
+    if (ioctl(fr_fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+        fprintf(stderr, "read fixed screen info failed!\n");
+        return -1;
+    }
+
+    /* get variable screen info */
+    if (ioctl(fr_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+        fprintf(stderr, "error read variable information!\n");
+        return -1;
+    }
+
+    screen_size = vinfo.xres_virtual * vinfo.yres_virtual * vinfo.bits_per_pixel/8;
+    frame_bpp = vinfo.bits_per_pixel;
+
+    buf = mmap(0, screen_size, PROT_READ|PROT_WRITE, MAP_SHARED, fr_fd,
+                            0);
+
+    if (!buf) {
+        fprintf(stderr, "mmap failed\n");
+        return -1;
+    }
+
+    fb_info->fd = fr_fd;
+    fb_info->start = buf;
+    fb_info->length = screen_size;
+    fb_info->width = vinfo.xres_virtual;
+    fb_info->height = vinfo.yres_virtual;
+    fb_info->bpp = frame_bpp;
+
+    return 0;
+}
+
+int get_camera_info(struct video_info* v_info) {
+    struct v4l2_capability caps;
+    struct v4l2_format fmt;
+    struct v4l2_fmtdesc fmtdesc;
+    int fd;
+
+    // printf("get_camera_info in\n");
+
+    fd = v_info->fd;
+
+    /* query capability */
+    if (ioctl(fd, VIDIOC_QUERYCAP, &caps) < 0) {
+        fprintf(stderr, "query capbility failed!\n");
+        return -1;
+    }
+
+    if (!caps.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+        fprintf(stderr, "device doesn't support capture feature...\n");
+        return -1;
+    }
+
+    printf("device support capture!\n");
+
+    memset(&fmt, 0, sizeof(struct v4l2_format));
+    fmt.type = V4L2_CAP_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
+        fprintf(stderr, "get format failed\n");
+        return -1;
+    }
+
+    fmtdesc.index = 0;
+    fmtdesc.type = V4L2_CAP_VIDEO_CAPTURE;
+    /* get current camera's support formats */
+    while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+        if (fmtdesc.pixelformat & fmt.fmt.pix.pixelformat) {
+            printf("\tformat:%s\n", fmtdesc.description);
+            break;
+        }
+
+        fmtdesc.index++;
+    }
+
+    // choose the default's format
+    v_info->width = fmt.fmt.pix.width;
+    v_info->height = fmt.fmt.pix.height;
+    v_info->pixelfmt = fmt.fmt.pix.pixelformat;
+
+    // printf("get_camera_info out\n");
+
+    return 0;
+}
+
+int set_format(struct video_info* v_info) {
+    int fd, ret;
+    struct v4l2_format fmt;
+
+    memset(&fmt, 0, sizeof(struct v4l2_format));
+
+    fd = v_info->fd;
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = v_info->width;
+    fmt.fmt.pix.height = v_info->height;
+    fmt.fmt.pix.pixelformat = v_info->pixelfmt;
+
+    ret = ioctl(fd, VIDIOC_S_FMT, &fmt);
+    if (ret < 0) {
+        printf("VIDIOC_S_FMT failed (%d)\n", ret);
+        return -1;
+    }
+
+    printf("-------------------VIDIOC_S_FMT---------------------\n");
+    printf("Stream Format Informations:\n");
+    printf(" type: %d\n", fmt.type);
+    printf(" width: %d\n", fmt.fmt.pix.width);
+    printf(" height: %d\n", fmt.fmt.pix.height);
+
+    return 0;
+}
+
+int req_bufs(struct video_info* v_info) {
+    int fd;
+    struct v4l2_requestbuffers req;
+
+    fd = v_info->fd;
+    memset(&req, 0, sizeof(req));
+    req.count = CBUF_NUM;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        fprintf(stderr, "VIDIOC_REQBUFS failed! errno:%d(%m)\n", errno);
+        return -1;
+    }
+
+    return 0;
+}
+
+void map_bufs(struct video_info* v_info) {
+    int i = 0;
+    struct v4l2_buffer tmp_buf;
+    int fd;
+
+    fd = v_info->fd;
+
+    v_info->bufs = calloc(CBUF_NUM, sizeof(struct video_buffer));
+    assert(v_info->bufs);
+
+    for (i=0; i< CBUF_NUM; i++) {
+        memset(&tmp_buf, 0, sizeof(tmp_buf));
+        tmp_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        tmp_buf.memory = V4L2_MEMORY_MMAP;
+        tmp_buf.index = i;
+
+        // query buffer info
+        if (ioctl(fd, VIDIOC_QUERYBUF, &tmp_buf) < 0) {
+            fprintf(stderr, "VIDIOC_QUERYBUF (%d) error\n", i);
+            return;
+        }
+
+        v_info->bufs[i].start = mmap(NULL, tmp_buf.length, PROT_READ|PROT_WRITE, MAP_SHARED,
+                fd, tmp_buf.m.offset);
+        v_info->bufs[i].length = tmp_buf.length;
+
+        assert(v_info->bufs[i].start);
+
+        if (ioctl(fd, VIDIOC_QBUF, &tmp_buf) < 0) {
+            fprintf(stderr, "enqueue video buffer failed! errno: %d(%m)\n", errno);
+            return;
+        }
+    }
+
+    return;
+}
+
+void unmap_bufs(struct video_info* v_info) {
+    int i;
+
+    for (i=0; i< CBUF_NUM; i++) {
+        munmap(v_info->bufs[i].start, v_info->bufs[i].length);
+    }
+
+    free(v_info->bufs);
+}
+
+int stream_on(struct video_info* v_info) {
+    int fd, ret;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    fd = v_info->fd;
+
+    // printf("stream on, fd = 0x%x\n", fd);
+
+    ret = ioctl(fd, VIDIOC_STREAMON, &type);
+
+    if (ret < 0) {
+        fprintf(stderr, "stream on failed, error: %d(%m)\n", errno);
+    }
+
+    return ret;
+}
+
+int stream_off(struct video_info* v_info) {
+    int fd, ret;
+    int off = 1;
+
+    fd = v_info->fd;
+
+    // printf("stream off, fd = 0x%x\n", fd);
+
+    ret = ioctl(fd, VIDIOC_STREAMOFF, &off);
+
+    if (ret < 0) {
+        fprintf(stderr, "stream off failed, error:%d(%m)\n", errno);
+    }
+
+    return ret;
+}
+
+int get_picture(struct video_info* v_info, uint8_t *buffer) {
+    int ret;
+    int fd;
+    struct v4l2_buffer dequeue;
+    struct v4l2_buffer enqueue;
+
+    memset(&dequeue, 0, sizeof(struct v4l2_buffer));
+    memset(&enqueue, 0, sizeof(struct v4l2_buffer));
+
+    dequeue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    dequeue.memory = V4L2_MEMORY_MMAP;
+
+    enqueue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    enqueue.memory = V4L2_MEMORY_MMAP;
+
+    fd = v_info->fd;
+
+    /* dequeue buffer */
+    ret = ioctl(fd, VIDIOC_DQBUF, &dequeue);
+
+    if (ret < 0) {
+        fprintf(stderr, "dequeue video frame failed\n");
+        return -1;
+    }
+
+    // printf("get picture[%d]\n", dequeue.index);
+
+    // copy yuv data to picture
+    memcpy(buffer, v_info->bufs[dequeue.index].start, v_info->bufs[dequeue.index].length);
+
+    enqueue.index = dequeue.index;
+    ret = ioctl(fd, VIDIOC_QBUF, &enqueue);
+
+    if (ret < 0) {
+        fprintf(stderr, "enqueue failed\n");
+        return -2;
+    }
+
+    return 0;
+}
+
+
+/* yuv to rgb algorithm*/
+static int sign3 = 1;
+/*
+YUV to RGB's calculation...
+R = 1.164*(Y-16) + 1.159*(V-128);
+G = 1.164*(Y-16) - 0.380*(U-128)+ 0.813*(V-128);
+B = 1.164*(Y-16) + 2.018*(U-128));
+*/
+int yuvtorgb(int y, int u, int v) {
+    uint32_t pixel32 = 0;
+    uint8_t *pixel = (uint8_t *)&pixel32;
+    int r, g, b;
+    static long int ruv, guv, buv;
+
+    if (1 == sign3) {
+        sign3 = 0;
+        ruv = 1159*(v-128);
+        guv = -380*(u-128) + 813*(v-128);
+        buv = 2018*(u-128);
+    }
+
+    r = (1164*(y-16) + ruv) / 1000;
+    g = (1164*(y-16) - guv) / 1000;
+    b = (1164*(y-16) + buv) / 1000;
+
+    if(r > 255) r = 255;
+    if(g > 255) g = 255;
+    if(b > 255) b = 255;
+    if(r < 0) r = 0;
+    if(g < 0) g = 0;
+    if(b < 0) b = 0;
+
+    pixel[0] = r;
+    pixel[1] = g;
+    pixel[2] = b;
+
+    return pixel32;
+}
+
+int yuv2rgb32(uint8_t* yuv, uint8_t* rgb, uint32_t width, uint32_t height) {
+    uint32_t in, out;
+    int y0, u, y1, v;
+    uint32_t pixel32;
+    uint8_t *pixel = (uint8_t *)&pixel32;
+    /* yuyv, yuv 4:2:2*/
+    uint32_t size = width*height*2;
+
+    for (in=0, out=0; in < size; in+=4, out+=8) {
+        y0 = yuv[in+0];
+        u  = yuv[in+1];
+        y1 = yuv[in+2];
+        v  = yuv[in+3];
+
+        sign3 = 1;
+        pixel32 = yuvtorgb(y0, u, v);
+        rgb[out+0] = pixel[0];
+        rgb[out+1] = pixel[1];
+        rgb[out+2] = pixel[2];
+        rgb[out+3] = 0;
+
+        pixel32 = yuvtorgb(y1, u, v);
+        rgb[out+4] = pixel[0];
+        rgb[out+5] = pixel[1];
+        rgb[out+6] = pixel[2];
+        rgb[out+7] = 0;
+    }
+
+    return 0;
+}
+
+void write_frames(uint8_t* img_buf, struct video_info* v_info,
+                        struct frame_info* fb_info) {
+    int row, column;
+    int num = 0;
+    rgb32_frame* rgb32_fbp = (rgb32_frame* )fb_info->start;
+    rgb32* rgb32_img_buf = (rgb32 *)img_buf;
+    uint32_t frame_x = fb_info->width;
+
+    for (row = 0; row < v_info->height; row++) {
+        for (column = 0; column < v_info->width; column++) {
+            rgb32_fbp[row * frame_x + column].r = rgb32_img_buf[num].r;
+            rgb32_fbp[row * frame_x + column].g = rgb32_img_buf[num].g;
+            rgb32_fbp[row * frame_x + column].b = rgb32_img_buf[num].b;
+
+            num++;
+        }
+    }
+}
+
+void exit_framebuffer(struct frame_info* fb_info) {
+    /* unmap memory */
+    munmap(fb_info->start, fb_info->length);
+
+    /* close framebuffer device */
+    close(fb_info->fd);
+}
+
+void close_camera(int fd) {
+    if (fd) {
+        close(fd);
+    }
+}
+
+static void *key_monitor(void* arg) {
+    /* 'q' for exit! */
+    while (getchar() != 'q' && g_exit != 1) {
+        sleep(1);
+    }
+
+    g_exit = 1;
+
+    return (void *)0;
+}
 
 int main(int argc, char *argv[]) {
     int fd = 0;
     int ret = 0;
-    int i = 0;
+    struct frame_info fb_info;
+    struct video_info video_info;
+    static uint8_t *yuv, *rgb;
+    uint64_t screen_size;
+    pthread_t pid;
+	pthread_attr_t attr;
 
-    struct v4l2_capability caps;
-    struct v4l2_fmtdesc fmtdesc;
-    // struct v4l2_crop crop;
-    struct v4l2_format fmt;
-    // struct v4l2_streamparm parm;
-    struct v4l2_requestbuffers req;
-    struct v4l2_buffer buf;
-    struct v4l2_frmsizeenum frmsize;
-    enum v4l2_buf_type type;
-    struct Buffer *buffers;
-    struct timespec prev, tp1, tp2;
-    long elapsed = 0, interval = 0;
-
-    if (argc != 2) {
-        fprintf(stderr, "usage: v4l2_cam device\n");
+    if (argc != 3) {
+        fprintf(stderr, "usage: v4l2_cam video_device fb_device!\n");
         return -1;
     }
 
-    /* open video device */
-    fd = open(argv[1], O_RDWR);
-
+    /* 1. open v4l2 capture device */
+    fd = open_camera(argv[1]);
     if (fd < 0) {
-        fprintf(stderr, "open device %s failed, error: %d(%m)",
-                            argv[1], errno);
+        fprintf(stderr, "open camera failed\n");
         return -1;
     }
 
-    /* query device capabilities */
-    ret = ioctl(fd, VIDIOC_QUERYCAP, &caps);
+    video_info.fd = fd;
+
+    /* 2. init frame buffer */
+    ret = init_framebuffer(argv[2], &fb_info);
     if (ret < 0) {
-        fprintf(stderr, "query caps failed, error: %d(%m)\n", errno);
-        return -1;
+        fprintf(stderr, "init framebuffer failed...\n");
+        goto fb_fail;
     }
 
-    printf("video device capabilities:\n");
-    printf("driver: %s\n", caps.driver);
-    printf("card: %s\n", caps.card);
-    printf("bus_info: %s\n", caps.bus_info);
-    printf("version: 0x%u\n", caps.version);
-    printf("capabilities: 0x%x\n", caps.capabilities);
-
-    if (V4L2_CAP_VIDEO_CAPTURE & caps.capabilities) {
-        printf("video capture\n");
-    }
-
-    if (V4L2_CAP_VIDEO_OUTPUT & caps.capabilities) {
-        printf("video output\n");
-    }
-
-    printf("device_caps: 0x%x\n", caps.device_caps);
-    printf("reserved[1]: %u\n", caps.reserved[1]);
-    printf("reserved[2]: %u\n", caps.reserved[2]);
-    printf("reserved[3]: %u\n", caps.reserved[3]);
-
-    if (!V4L2_CAP_VIDEO_CAPTURE & caps.capabilities) {
-        fprintf(stderr, "device doesn't support video capture!! exit...\n");
-        return -1;
-    }
-
-    printf("enum format:\n");
-    fmtdesc.index = 0;
-    fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    /* enum capture device supported format... */
-    while(ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) != -1) {
-        printf("\t%d.%s\n", fmtdesc.index+1, fmtdesc.description);
-        fmtdesc.index++;
-    }
-    printf("enum format end:\n");
-
-    printf("enum support frame size...\n");
-    while(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) != -1) {
-        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
-            printf("line:%d %dx%d\n",__LINE__, frmsize.discrete.width, frmsize.discrete.height);
-        } else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
-            printf("line:%d %dx%d\n",__LINE__, frmsize.discrete.width, frmsize.discrete.height);
-        }
-    }
-    printf("enum support frame size end\n");
-
-    /* set capture device parameter */
-    // standard, such as pal, ntsc... no need...
-    // ioctl(fd, VIDIOC_S_STD, &std_id);
-
-    // no need to set crop...
-    // ioctl(fd, VIDIOC_S_CROP, &crop);
-
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-    fmt.fmt.pix.height = IMAGE_HEIGHT;
-    fmt.fmt.pix.width = IMAGE_WIDTH;
-    fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
-    // fmt.fmt.pix.field = V4L2_FIELD_ANY;
-    ret = ioctl(fd, VIDIOC_S_FMT, &fmt);
+    /* 3. get camera info */
+    ret = get_camera_info(&video_info);
     if (ret < 0) {
-        fprintf(stderr, "v4l2 set format failed, error: %d(%m)\n", errno);
-        return -1;
+        fprintf(stderr, "get camera info failed\n");
+        goto query_fail;
     }
 
-    printf("======================================================================\n");
+    /* 4. set camera format */
+    set_format(&video_info);
 
+    /* 5. request buffers */
+    req_bufs(&video_info);
 
-    ret = ioctl(fd, VIDIOC_G_FMT, &fmt);
-    if (ret < 0) {
-        fprintf(stderr, "v4l2 get format failed, error: %d(%m)\n", errno);
-        return -1;
+    /* 6. map memory to user space and enqueue video buffer */
+    map_bufs(&video_info);
+
+    /* 7. stream on */
+    stream_on(&video_info);
+
+    /* allocate yuv & rgb buffer */
+    screen_size = video_info.width*video_info.height;
+
+    printf("screen_size = %ld\n", screen_size);
+
+    yuv = (uint8_t *)calloc(1, screen_size * 2);
+    rgb = (uint8_t *)calloc(1, screen_size * 4);
+
+    assert(yuv&&rgb);
+
+    pthread_attr_init(&attr);
+	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) < 0) {
+        fprintf(stderr, "set detach state failed\n");
+        goto detach_fail;
+    }
+    /* create pthread to monitor keyboard input */
+    if (pthread_create(&pid, &attr, key_monitor, NULL) < 0) {
+        fprintf(stderr, "create thread failed! errno: %d(%m)\n", errno);
+        goto thread_fail;
     }
 
-    printf("v4l2 get format:\n");
-    printf("type: %d\n", fmt.type);
-    printf("pixelformat: %c%c%c%c\n", fmt.fmt.pix.pixelformat & 0xFF,
-            (fmt.fmt.pix.pixelformat>>8) & 0xFF,
-            (fmt.fmt.pix.pixelformat>>16) & 0xFF,
-            (fmt.fmt.pix.pixelformat>>24) & 0xFF);
-    printf("height: %d\n", fmt.fmt.pix.height);
-    printf("width: %d\n", fmt.fmt.pix.width);
-    printf("field:%d\n", fmt.fmt.pix.field);
+    /* 8. while loop to get frame and show pictures... */
+    while (!g_exit) {
+        // get yuv data
+        get_picture(&video_info, yuv);
 
-    // set framerate
-    // ioctl(fd, VIDIOC_S_PARM)
+        // convert yuv data to rgb
+        yuv2rgb32(yuv, rgb, video_info.width, video_info.height);
 
-    // request buffer
-    memset(&req, 0, sizeof(req));
-    req.count = VIDEO_COUNT;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    // req.memory = V4L2_MEMORY_DMABUF;
-    req.memory = V4L2_MEMORY_MMAP;
-    ret = ioctl(fd, VIDIOC_REQBUFS, &req);
-    if (ret < 0) {
-        printf("request buffer failed... errno:%d(%m)\n", errno);
-        return -1;
+        // write data to frame buffer device
+        write_frames(rgb, &video_info, &fb_info);
     }
 
-    // query buffer
-    ret = ioctl(fd, VIDIOC_QUERYBUF, &buf);
-    printf("buffer info:\n");
-    printf("index: %d\n", buf.index);
-    printf("memory: 0x%x\n", buf.memory);
-    printf("offset: 0x%x\n", buf.m.offset);
-    printf("length: %d\n", buf.length);
+    /* 9. stream off */
+    stream_off(&video_info);
 
-    // calloc video frame's addr
-    buffers = calloc(req.count, sizeof(struct Buffer));
+    free(yuv);
+    free(rgb);
 
-    if (!buffers) {
-        fprintf(stderr, "Out Of Memory!\n");
-        goto malloc_fail;
-    }
+    /* 10. unmaped the memory */
+    unmap_bufs(&video_info);
 
-    for (i=0; i<VIDEO_COUNT; i++) {
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
+    /* 11. close frame buffer */
+    exit_framebuffer(&fb_info);
 
-        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            goto query_fail;
-        }
+    /* 12. close v4l2 capture device */
+    close_camera(fd);
 
-        printf("buffer[%d] info:\n", i);
-        printf("index: %d\n", buf.index);
-        printf("memory: 0x%x\n", buf.memory);
-        printf("offset: 0x%x\n", buf.m.offset);
-        printf("length: %d\n", buf.length);
-
-        buffers[i].length = buf.length;
-
-        // mmap video buffer(vmalloced) to user space
-        buffers[i].start = mmap(NULL, buf.length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
-
-        if (MAP_FAILED == buffers[i].start) {
-            fprintf(stderr, "mmap %d memory failed!", i);
-            goto map_failed;
-        }
-    }
-
-    // queue 3 buffers
-    for (i=0; i<VIDEO_COUNT; i++) {
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            fprintf(stderr, "queue buffer[%d] failed\n", buf.index);
-            goto queue_fail;
-        }
-    }
-
-    // stream on
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-        fprintf(stderr, "stream on failed, errno: %d(%m)\n", errno);
-        goto streamon_fail;
-    }
-
-    memset(&prev, 0, sizeof(prev));
-    // while loop to dequeue buffer and show it...
-    while (1) {
-#if 0
-        /* check if stdin keyboard hit */
-        if (kbhit() < 0) {
-            // do nothing
-            printf("keyboard not hit...\n");
-        } else {
-            printf("'q' for exit!\n");
-            if (getchar() == 'q') {
-                break;
-            } else {
-                // do nothing
-            }
-        }
-#endif
-
-        /* get time tp1 */
-        clock_gettime(CLOCK_MONOTONIC, &tp1);
-
-        interval = (tp1.tv_sec - prev.tv_sec)*1000
-                        + (tp1.tv_nsec - prev.tv_nsec)/(1000*1000);
-
-        if (prev.tv_sec == 0) {
-            // do nothing
-        } else {
-            printf("get picture interval(frame rate?): %ld ms\n", interval);
-        }
-
-        prev.tv_sec = tp1.tv_sec;
-        prev.tv_nsec = tp1.tv_nsec;
-
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-            fprintf(stderr, "dequeue buffer failed, errno=%d(%m)\n", errno);
-            goto dequeue_fail;
-        }
-
-        // process the yuv data...
-        printf("todo -- process picture[%d] data...\n", buf.index);
-
-        // queue buffer
-        if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            fprintf(stderr, "queue buffer[%d] failed\n", buf.index);
-            goto queue_fail;
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &tp2);
-
-        elapsed = (tp2.tv_sec - tp1.tv_sec)*1000 + (tp2.tv_nsec - tp1.tv_nsec)/(1000*1000);
-
-        printf("queue, dequeue totally cost %ld ms\n", elapsed);
-    }
-
-    // stream off
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(fd, VIDIOC_STREAMOFF, &type);
-
-    // unmap memory
-    for (i=0; i<VIDEO_COUNT; i++) {
-        if (munmap(buffers[i].start, buffers[i].length) < 0) {
-            fprintf(stderr, "munmap failed, error=%d(%m)\n", errno);
-        }
-    }
-
-    // close video device
-    close(fd);
-
-    printf("exit main...\n");
     return 0;
 
-queue_fail:
+thread_fail:
+detach_fail:
     /* stream off */
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(fd, VIDIOC_STREAMOFF, &type);
-streamon_fail:
-dequeue_fail:
-    /* unmaped the data */
-    for (i=0; i<VIDEO_COUNT; i++) {
-        if (munmap(buffers[i].start, buffers[i].length) < 0) {
-            fprintf(stderr, "munmap failed, error=%d(%m)\n", errno);
-        }
-    }
+    stream_off(&video_info);
 
-map_failed:
-    if (buffers) {
-        free(buffers);
-    }
+    /* unmaped the memory */
+    unmap_bufs(&video_info);
+
 query_fail:
-malloc_fail:
-    close(fd);
+    exit_framebuffer(&fb_info);
 
-    return -1;
+fb_fail:
+
+    close_camera(fd);
+
+    return ret;
 }

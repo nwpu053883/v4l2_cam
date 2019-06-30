@@ -1,6 +1,6 @@
 CC=gcc
 CFLAGS=-g -Wall
-LDFLAGS=
+LDFLAGS=-lpthread
 
 target=v4l2_cam
 objs=$(patsubst %.c, %.o, $(wildcard *.c))
@@ -12,7 +12,7 @@ $(target):$(objs)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 .c.o:
-	$(CC) -c $< $(CFLASG)
+	$(CC) -c $< $(CFLAGS)
 
 install:
 	cp $(target) $(install_path) -rf
